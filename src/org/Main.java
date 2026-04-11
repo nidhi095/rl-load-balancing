@@ -3,82 +3,71 @@ package org;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Main.java  –  Comparison Driver
- *
- * The ONLY file you touch when adding or removing strategies.
- *
- * Each call to runOne() is completely independent:
- *   fresh CloudSim init  →  fresh datacenter, VMs, cloudlets
- *   →  strategy applied  →  results collected  →  metrics printed
- *
- * Adding a new heuristic
- * ──────────────────────
- *   1. Create  YourStrategy.java  implementing AssignmentStrategy
- *   2. Add one line here:  runOne(new YourStrategy(), "Your Strategy", results)
- *   That's it. Nothing else changes.
- */
 public class Main {
 
-    public static void main(String[] args) {
+    private static final int TRAINING_EPISODES = 5_000;
+    private static final int LOG_INTERVAL      = 500;
 
+    public static void main(String[] args) {
         System.out.println("╔══════════════════════════════════════════════════════╗");
         System.out.println("║    CloudSim Load Balancing – Strategy Comparison     ║");
         System.out.println("╚══════════════════════════════════════════════════════╝");
-        System.out.printf("  VMs: %d   |   Cloudlets: %d%n",
+        System.out.printf("  VMs: %d   |   Cloudlets: %d%n%n",
                 SimulationConfig.NUM_VMS, SimulationConfig.NUM_CLOUDLETS);
 
-        // Accumulate Metrics objects for the final comparison table.
         List<Metrics> allResults = new ArrayList<>();
 
-        // ── Run each strategy ────────────────────────────────────────────────
-        // Order here is purely cosmetic; each run is isolated.
+        // ── 1. Heuristics ─────────────────────────────────────────────────────
+        System.out.println("[ Heuristics ]");
+        runOne(new FCFSStrategy(),        "FCFS",         allResults);
+        runOne(new RoundRobinStrategy(),  "Round Robin",  allResults);
+        runOne(new LeastLoadedStrategy(), "Least Loaded", allResults);
+        runOne(new MinMinStrategy(),      "Min-Min",      allResults);
+        runOne(new MaxMinStrategy(),      "Max-Min",      allResults);
 
-        runOne(new FCFSStrategy(),        "FCFS",          allResults);
-        runOne(new RoundRobinStrategy(),  "Round Robin",   allResults);
-        runOne(new LeastLoadedStrategy(), "Least Loaded",  allResults);
-        runOne(new MinMinStrategy(),      "Min-Min",       allResults);
-        runOne(new MaxMinStrategy(),      "Max-Min",       allResults);
-        runOne(new RLStrategy(),          "RL (stub)",     allResults);
+        // ── 2. RL Training ────────────────────────────────────────────────────
+        RLStrategy rl = new RLStrategy();
+        System.out.printf("%n[ RL Training — %d episodes ]%n", TRAINING_EPISODES);
+        System.out.printf("  %-8s  %-8s  %-10s%n", "Episode", "Epsilon", "Q-States");
+        System.out.println("  " + "─".repeat(30));
 
-        // ── Final comparison table ────────────────────────────────────────────
+        for (int ep = 1; ep <= TRAINING_EPISODES; ep++) {
+            SimulationRunner.run(rl, "Training");
+            if (ep == 1 || ep % LOG_INTERVAL == 0) {
+                System.out.printf("  %-8d  %-8.4f  %-10d%n",
+                        ep, rl.getEpsilon(), rl.getQTableSize());
+            }
+        }
+
+        System.out.println("  " + "─".repeat(30));
+        System.out.printf("  Training complete.  Final ε=%.4f  Q-states=%d%n%n",
+                rl.getEpsilon(), rl.getQTableSize());
+
+        /*
+         * Tip: if Q-States at episode 5 000 is still growing rapidly, the table
+         * has not saturated — increase TRAINING_EPISODES to 8 000–10 000.
+         * With the 243-state v3 table this should stop growing well before ep 1 000.
+         */
+
+        // ── 3. Final evaluation (greedy policy) ───────────────────────────────
+        rl.setEpsilon(0.0);
+        System.out.println("[ RL Final Evaluation ]");
+        runOne(rl, "RL (Trained)", allResults);
+
+        // ── 4. Comparison table ───────────────────────────────────────────────
         ResultPrinter.printComparisonTable(allResults);
     }
 
-    // =========================================================================
-    //  runOne — orchestrates a single strategy's full lifecycle
-    // =========================================================================
-
-    /**
-     * Run one simulation, compute metrics, print results, accumulate summary.
-     *
-     * @param strategy   the load-balancing algorithm to evaluate
-     * @param name       display label used in all output
-     * @param allResults list to append this run's {@link Metrics} to
-     */
     private static void runOne(AssignmentStrategy strategy,
-                               String name,
-                               List<Metrics> allResults) {
+                               String name, List<Metrics> results) {
         ResultPrinter.printSectionHeader(name);
-
         try {
-            // 1. Run a completely fresh simulation with this strategy
             SimulationResult result = SimulationRunner.run(strategy, name);
-
-            // 2. Print the per-cloudlet execution table
-            ResultPrinter.printCloudletTable(result);
-
-            // 3. Compute all 8 metrics from the raw CloudSim output
             Metrics metrics = MetricsCalculator.compute(result);
-
-            // 4. Print the metrics block for this strategy
             ResultPrinter.printMetrics(metrics);
-
-            // 5. Save for comparison table
-            allResults.add(metrics);
-
-        } catch (RuntimeException e) {
-            System.err.println("  [ERROR] Simulation failed for strategy: " + name);
+            results.add(metrics);
+        } catch (Exception e) {
+            System.err.println("  [ERROR] Strategy failed: " + name);
             e.printStackTrace();
         }
     }
