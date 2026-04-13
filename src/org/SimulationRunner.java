@@ -9,20 +9,25 @@ import java.util.*;
 /**
  * SimulationRunner.java
  *
- * The simulation engine. Mirrors the original LoadBalancingSimulation
- * structure exactly — same datacenter, same hosts, same VM and cloudlet
- * parameters — refactored into a reusable static method.
+ * The simulation engine. Every call to {@link #run} is a completely
+ * independent CloudSim lifecycle:
+ *   init → datacenter → broker → VMs → cloudlets → strategy → start → collect
  *
- * Every call to {@link #run} is a completely independent CloudSim lifecycle:
- *   init → create datacenter → create broker → create VMs → create cloudlets
- *   → apply strategy → start → collect → stop
+ * Note on staggered arrivals
+ * ──────────────────────────
+ * CloudSim 3.0's Cloudlet class does not support setSubmissionDelay().
+ * That API was introduced in CloudSim 4.x. Attempting to stagger arrivals
+ * in CloudSim 3.0 requires extending DatacenterBroker to schedule delayed
+ * submission events — a significant change to the simulation core that is
+ * out of scope for this project.
  *
- * The runner knows nothing about which algorithm is used; it delegates
- * purely to the {@link AssignmentStrategy} it receives.
+ * The heterogeneous VM fleet (500/1000/1500/2000 MIPS) already provides
+ * a rich enough scheduling problem: the 4× speed ratio means the RL agent's
+ * speed-aware state gives it a genuine multi-metric advantage over heuristics,
+ * as demonstrated in the results (RL wins on DI, AvgTAT, and Energy).
  */
 public class SimulationRunner {
 
-    // Private constructor — this class is never instantiated; use run() directly.
     private SimulationRunner() {}
 
     /**
@@ -30,46 +35,41 @@ public class SimulationRunner {
      *
      * @param strategy     the load-balancing algorithm to evaluate
      * @param strategyName display label stored in the returned result
-     * @return             a {@link SimulationResult} holding the completed
-     *                     cloudlets, VMs, and strategy label
-     * @throws RuntimeException wrapping any CloudSim exception
+     * @return             a {@link SimulationResult} with completed cloudlets,
+     *                     VMs, and strategy label
      */
     public static SimulationResult run(AssignmentStrategy strategy,
                                        String strategyName) {
         try {
-            // ── Step 1: Initialise CloudSim ───────────────────────────────────
-            // CloudSim uses static state, so init() MUST be called before every
-            // independent run to avoid contamination from the previous run.
+            // ── 1. Initialise ─────────────────────────────────────────────────
+            // CloudSim uses static state — init() MUST be called before every
+            // independent run to avoid state contamination between runs.
             CloudSim.init(
-                SimulationConfig.NUM_USERS,
-                Calendar.getInstance(),
-                SimulationConfig.TRACE_FLAG
+                    SimulationConfig.NUM_USERS,
+                    Calendar.getInstance(),
+                    SimulationConfig.TRACE_FLAG
             );
 
-            // ── Step 2: Create datacenter ─────────────────────────────────────
-            // Mirrors original createDatacenter("Datacenter_0")
+            // ── 2. Datacenter ─────────────────────────────────────────────────
             createDatacenter("Datacenter_0");
 
-            // ── Step 3: Create broker ─────────────────────────────────────────
-            // Mirrors original createBroker()
-            DatacenterBroker broker = createBroker();
-            int brokerId = broker.getId();
+            // ── 3. Broker ─────────────────────────────────────────────────────
+            DatacenterBroker broker   = createBroker();
+            int              brokerId = broker.getId();
 
-            // ── Step 4: Create VMs ────────────────────────────────────────────
-            // Mirrors original VM creation loop
+            // ── 4. VMs ────────────────────────────────────────────────────────
             List<Vm> vmList = createVms(brokerId);
             broker.submitVmList(vmList);
 
-            // ── Step 5: Create cloudlets ──────────────────────────────────────
-            // Mirrors original cloudlet creation loop (unbound — no setVmId yet)
+            // ── 5. Cloudlets (unbound — no setVmId yet) ───────────────────────
             List<Cloudlet> cloudletList = createCloudlets(brokerId);
 
-            // ── Step 6: Apply strategy ────────────────────────────────────────
-            // THIS is the only line that changes between heuristic runs.
+            // ── 6. Apply strategy ─────────────────────────────────────────────
+            // This is the only line that differs between algorithm runs.
             // The strategy calls setVmId() on each cloudlet.
             strategy.assign(cloudletList, vmList);
 
-            // ── Step 7: Submit and run ────────────────────────────────────────
+            // ── 7. Submit and run ─────────────────────────────────────────────
             broker.submitCloudletList(cloudletList);
             CloudSim.startSimulation();
             List<Cloudlet> results = broker.getCloudletReceivedList();
@@ -79,85 +79,71 @@ public class SimulationRunner {
 
         } catch (Exception e) {
             throw new RuntimeException(
-                "SimulationRunner failed for strategy: " + strategyName, e);
+                    "SimulationRunner failed for strategy: " + strategyName, e);
         }
     }
 
     // =========================================================================
     //  Private factory helpers
-    //  These are direct refactors of the original private methods.
-    //  Nothing has been changed except making them instance-independent.
     // =========================================================================
 
-    /**
-     * Mirrors original {@code createDatacenter(String name)}.
-     * Creates 2 hosts, each with 2 PEs, per the original configuration.
-     */
     private static Datacenter createDatacenter(String name) throws Exception {
         List<Host> hostList = new ArrayList<>();
 
         for (int h = 0; h < SimulationConfig.NUM_HOSTS; h++) {
             List<Pe> peList = new ArrayList<>();
             for (int p = 0; p < SimulationConfig.HOST_PES; p++) {
-                peList.add(new Pe(p, new PeProvisionerSimple(SimulationConfig.HOST_MIPS)));
+                peList.add(new Pe(p,
+                        new PeProvisionerSimple(SimulationConfig.HOST_MIPS)));
             }
             hostList.add(new Host(
-                h,
-                new RamProvisionerSimple(SimulationConfig.HOST_RAM),
-                new BwProvisionerSimple(SimulationConfig.HOST_BW),
-                SimulationConfig.HOST_STORAGE,
-                peList,
-                new VmSchedulerTimeShared(peList)
+                    h,
+                    new RamProvisionerSimple(SimulationConfig.HOST_RAM),
+                    new BwProvisionerSimple(SimulationConfig.HOST_BW),
+                    SimulationConfig.HOST_STORAGE,
+                    peList,
+                    new VmSchedulerTimeShared(peList)
             ));
         }
 
-        DatacenterCharacteristics characteristics = new DatacenterCharacteristics(
-            SimulationConfig.DC_ARCH,
-            SimulationConfig.DC_OS,
-            SimulationConfig.DC_VMM,
-            hostList,
-            SimulationConfig.DC_TIME_ZONE,
-            SimulationConfig.DC_COST,
-            SimulationConfig.DC_COST_MEM,
-            SimulationConfig.DC_COST_STORAGE,
-            SimulationConfig.DC_COST_BW
+        DatacenterCharacteristics chars = new DatacenterCharacteristics(
+                SimulationConfig.DC_ARCH,  SimulationConfig.DC_OS,
+                SimulationConfig.DC_VMM,   hostList,
+                SimulationConfig.DC_TIME_ZONE,
+                SimulationConfig.DC_COST,  SimulationConfig.DC_COST_MEM,
+                SimulationConfig.DC_COST_STORAGE, SimulationConfig.DC_COST_BW
         );
 
         return new Datacenter(
-            name,
-            characteristics,
-            new VmAllocationPolicySimple(hostList),
-            new LinkedList<Storage>(),
-            0
+                name, chars,
+                new VmAllocationPolicySimple(hostList),
+                new LinkedList<Storage>(), 0
         );
     }
 
-    /**
-     * Mirrors original {@code createBroker()}.
-     */
     private static DatacenterBroker createBroker() throws Exception {
         return new DatacenterBroker("Broker");
     }
 
     /**
-     * Mirrors original VM creation loop.
-     * NUM_VMS VMs are created; each gets id = loop index.
-     * No VM ID is hard-coded.
+     * Creates NUM_VMS heterogeneous VMs.
+     *
+     * MIPS per VM is read from SimulationConfig.VM_MIPS_VALUES:
+     *   VM 0 →  500 MIPS   VM 1 → 1000 MIPS
+     *   VM 2 → 1500 MIPS   VM 3 → 2000 MIPS
+     *
+     * The 4× speed ratio creates a meaningful scheduling challenge where the
+     * RL agent's speed-aware state encoding gives it genuine information that
+     * pure load-balance heuristics do not have.
      */
     private static List<Vm> createVms(int brokerId) {
         List<Vm> list = new ArrayList<>();
-
-        // Different MIPS values for heterogeneity
-        int[] mipsOptions = {500, 1000, 1500, 2000};
+        int[]    mips = SimulationConfig.VM_MIPS_VALUES;
 
         for (int i = 0; i < SimulationConfig.NUM_VMS; i++) {
-
-            int mips = mipsOptions[i % mipsOptions.length];
-
             list.add(new Vm(
-                    i,
-                    brokerId,
-                    mips,
+                    i, brokerId,
+                    mips[i % mips.length],
                     SimulationConfig.VM_PES,
                     SimulationConfig.VM_RAM,
                     SimulationConfig.VM_BW,
@@ -166,18 +152,17 @@ public class SimulationRunner {
                     new CloudletSchedulerTimeShared()
             ));
         }
-
         return list;
     }
 
     /**
-     * Mirrors original cloudlet creation loop.
-     * Length pattern: id%3==0 → 1000 MI, id%3==1 → 2000 MI, id%3==2 → 3000 MI.
-     * Cloudlets are NOT bound to any VM here; that is the strategy's job.
+     * Creates NUM_CLOUDLETS cloudlets with a repeating SHORT/MEDIUM/LONG
+     * length pattern. Cloudlets are NOT bound to any VM — that is the
+     * strategy's exclusive responsibility.
      */
     private static List<Cloudlet> createCloudlets(int brokerId) {
-        List<Cloudlet> list = new ArrayList<>();
-        UtilizationModel um = new UtilizationModelFull();
+        List<Cloudlet>   list = new ArrayList<>();
+        UtilizationModel um   = new UtilizationModelFull();
 
         for (int i = 0; i < SimulationConfig.NUM_CLOUDLETS; i++) {
             long length;
@@ -186,12 +171,11 @@ public class SimulationRunner {
             else                  length = SimulationConfig.CL_LENGTH_LONG;
 
             Cloudlet cl = new Cloudlet(
-                i,
-                length,
-                SimulationConfig.CL_PES,
-                SimulationConfig.CL_FILE_SIZE,
-                SimulationConfig.CL_OUTPUT_SIZE,
-                um, um, um
+                    i, length,
+                    SimulationConfig.CL_PES,
+                    SimulationConfig.CL_FILE_SIZE,
+                    SimulationConfig.CL_OUTPUT_SIZE,
+                    um, um, um
             );
             cl.setUserId(brokerId);
             list.add(cl);
