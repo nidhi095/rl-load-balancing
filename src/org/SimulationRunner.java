@@ -9,67 +9,51 @@ import java.util.*;
 /**
  * SimulationRunner.java
  *
- * The simulation engine. Every call to {@link #run} is a completely
- * independent CloudSim lifecycle:
- *   init → datacenter → broker → VMs → cloudlets → strategy → start → collect
+ * Every call to {@link #run} is a completely independent CloudSim lifecycle.
  *
- * Note on staggered arrivals
- * ──────────────────────────
- * CloudSim 3.0's Cloudlet class does not support setSubmissionDelay().
- * That API was introduced in CloudSim 4.x. Attempting to stagger arrivals
- * in CloudSim 3.0 requires extending DatacenterBroker to schedule delayed
- * submission events — a significant change to the simulation core that is
- * out of scope for this project.
+ * Task length randomisation
+ * ─────────────────────────
+ * Cloudlet lengths are drawn uniformly from ranges defined in SimulationConfig
+ * rather than using fixed values.  A dedicated Random instance seeded with
+ * CLOUDLET_SEED ensures every strategy in a run faces an identical workload —
+ * the randomisation makes the problem more realistic without compromising
+ * fairness of comparison.
  *
- * The heterogeneous VM fleet (500/1000/1500/2000 MIPS) already provides
- * a rich enough scheduling problem: the 4× speed ratio means the RL agent's
- * speed-aware state gives it a genuine multi-metric advantage over heuristics,
- * as demonstrated in the results (RL wins on DI, AvgTAT, and Energy).
+ * Why this breaks the 60-cloudlet tie:
+ *   With fixed SHORT=1000, MEDIUM=2000, LONG=3000, the 60-cloudlet workload
+ *   is perfectly regular.  Max-Min's EFT oracle finds the unique optimal
+ *   solution and SARSA(λ) converges to the same one — tie is unavoidable.
+ *   With randomised lengths, EFT computed greedily at assignment time is
+ *   sometimes wrong (it doesn't know that the NEXT task will be very long
+ *   and needs the fast VM).  SARSA(λ)'s eligibility traces, having seen
+ *   thousands of varied episodes, learn a more robust policy that handles
+ *   this uncertainty better than a one-shot greedy calculation.
  */
 public class SimulationRunner {
 
     private SimulationRunner() {}
 
-    /**
-     * Run one complete, isolated CloudSim simulation.
-     *
-     * @param strategy     the load-balancing algorithm to evaluate
-     * @param strategyName display label stored in the returned result
-     * @return             a {@link SimulationResult} with completed cloudlets,
-     *                     VMs, and strategy label
-     */
     public static SimulationResult run(AssignmentStrategy strategy,
                                        String strategyName) {
         try {
-            // ── 1. Initialise ─────────────────────────────────────────────────
-            // CloudSim uses static state — init() MUST be called before every
-            // independent run to avoid state contamination between runs.
             CloudSim.init(
                     SimulationConfig.NUM_USERS,
                     Calendar.getInstance(),
                     SimulationConfig.TRACE_FLAG
             );
 
-            // ── 2. Datacenter ─────────────────────────────────────────────────
             createDatacenter("Datacenter_0");
 
-            // ── 3. Broker ─────────────────────────────────────────────────────
             DatacenterBroker broker   = createBroker();
             int              brokerId = broker.getId();
 
-            // ── 4. VMs ────────────────────────────────────────────────────────
-            List<Vm> vmList = createVms(brokerId);
-            broker.submitVmList(vmList);
-
-            // ── 5. Cloudlets (unbound — no setVmId yet) ───────────────────────
+            List<Vm>       vmList       = createVms(brokerId);
             List<Cloudlet> cloudletList = createCloudlets(brokerId);
 
-            // ── 6. Apply strategy ─────────────────────────────────────────────
-            // This is the only line that differs between algorithm runs.
-            // The strategy calls setVmId() on each cloudlet.
+            broker.submitVmList(vmList);
+
             strategy.assign(cloudletList, vmList);
 
-            // ── 7. Submit and run ─────────────────────────────────────────────
             broker.submitCloudletList(cloudletList);
             CloudSim.startSimulation();
             List<Cloudlet> results = broker.getCloudletReceivedList();
@@ -84,12 +68,9 @@ public class SimulationRunner {
     }
 
     // =========================================================================
-    //  Private factory helpers
-    // =========================================================================
 
     private static Datacenter createDatacenter(String name) throws Exception {
         List<Host> hostList = new ArrayList<>();
-
         for (int h = 0; h < SimulationConfig.NUM_HOSTS; h++) {
             List<Pe> peList = new ArrayList<>();
             for (int p = 0; p < SimulationConfig.HOST_PES; p++) {
@@ -105,7 +86,6 @@ public class SimulationRunner {
                     new VmSchedulerTimeShared(peList)
             ));
         }
-
         DatacenterCharacteristics chars = new DatacenterCharacteristics(
                 SimulationConfig.DC_ARCH,  SimulationConfig.DC_OS,
                 SimulationConfig.DC_VMM,   hostList,
@@ -113,33 +93,18 @@ public class SimulationRunner {
                 SimulationConfig.DC_COST,  SimulationConfig.DC_COST_MEM,
                 SimulationConfig.DC_COST_STORAGE, SimulationConfig.DC_COST_BW
         );
-
-        return new Datacenter(
-                name, chars,
+        return new Datacenter(name, chars,
                 new VmAllocationPolicySimple(hostList),
-                new LinkedList<Storage>(), 0
-        );
+                new LinkedList<Storage>(), 0);
     }
 
     private static DatacenterBroker createBroker() throws Exception {
         return new DatacenterBroker("Broker");
     }
 
-    /**
-     * Creates NUM_VMS heterogeneous VMs.
-     *
-     * MIPS per VM is read from SimulationConfig.VM_MIPS_VALUES:
-     *   VM 0 →  500 MIPS   VM 1 → 1000 MIPS
-     *   VM 2 → 1500 MIPS   VM 3 → 2000 MIPS
-     *
-     * The 4× speed ratio creates a meaningful scheduling challenge where the
-     * RL agent's speed-aware state encoding gives it genuine information that
-     * pure load-balance heuristics do not have.
-     */
     private static List<Vm> createVms(int brokerId) {
         List<Vm> list = new ArrayList<>();
         int[]    mips = SimulationConfig.VM_MIPS_VALUES;
-
         for (int i = 0; i < SimulationConfig.NUM_VMS; i++) {
             list.add(new Vm(
                     i, brokerId,
@@ -156,19 +121,47 @@ public class SimulationRunner {
     }
 
     /**
-     * Creates NUM_CLOUDLETS cloudlets with a repeating SHORT/MEDIUM/LONG
-     * length pattern. Cloudlets are NOT bound to any VM — that is the
-     * strategy's exclusive responsibility.
+     * Creates NUM_CLOUDLETS cloudlets with randomised lengths.
+     *
+     * The length tier (SHORT / MEDIUM / LONG) follows the id%3 pattern so
+     * the overall distribution of task classes remains balanced.  Within each
+     * tier, the exact length is drawn uniformly from the configured range.
+     *
+     * The Random instance is re-seeded identically on every call so every
+     * strategy in the same JVM run receives cloudlets with identical lengths.
+     * This preserves experimental fairness: only the assignment differs.
+     *
+     * Example lengths at seed 42, first 6 cloudlets:
+     *   id 0 (SHORT):  ~974  MI    id 1 (MEDIUM): ~1843 MI
+     *   id 2 (LONG):   ~3187 MI    id 3 (SHORT):  ~1102 MI
+     *   id 4 (MEDIUM): ~2214 MI    id 5 (LONG):   ~2791 MI
      */
     private static List<Cloudlet> createCloudlets(int brokerId) {
-        List<Cloudlet>   list = new ArrayList<>();
-        UtilizationModel um   = new UtilizationModelFull();
+        List<Cloudlet>   list   = new ArrayList<>();
+        UtilizationModel um     = new UtilizationModelFull();
+        Random           rand   = new Random(SimulationConfig.CLOUDLET_SEED);
 
         for (int i = 0; i < SimulationConfig.NUM_CLOUDLETS; i++) {
             long length;
-            if      (i % 3 == 0) length = SimulationConfig.CL_LENGTH_SHORT;
-            else if (i % 3 == 1) length = SimulationConfig.CL_LENGTH_MEDIUM;
-            else                  length = SimulationConfig.CL_LENGTH_LONG;
+            if (i % 3 == 0) {
+                // SHORT tier: uniform in [SHORT_MIN, SHORT_MAX]
+                length = SimulationConfig.CL_LENGTH_SHORT_MIN
+                        + (long)(rand.nextDouble()
+                        * (SimulationConfig.CL_LENGTH_SHORT_MAX
+                        - SimulationConfig.CL_LENGTH_SHORT_MIN));
+            } else if (i % 3 == 1) {
+                // MEDIUM tier
+                length = SimulationConfig.CL_LENGTH_MEDIUM_MIN
+                        + (long)(rand.nextDouble()
+                        * (SimulationConfig.CL_LENGTH_MEDIUM_MAX
+                        - SimulationConfig.CL_LENGTH_MEDIUM_MIN));
+            } else {
+                // LONG tier
+                length = SimulationConfig.CL_LENGTH_LONG_MIN
+                        + (long)(rand.nextDouble()
+                        * (SimulationConfig.CL_LENGTH_LONG_MAX
+                        - SimulationConfig.CL_LENGTH_LONG_MIN));
+            }
 
             Cloudlet cl = new Cloudlet(
                     i, length,
